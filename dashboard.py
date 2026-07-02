@@ -1,6 +1,8 @@
 import psutil
 import time
 import platform
+import sqlite3
+from collections import deque
 from datetime import datetime
 
 from rich.live import Live
@@ -11,7 +13,7 @@ from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn
 from rich.text import Text
 from rich.align import Align
 
-# Try to load AMD GPU tools gracefully (catches missing /dev/dri/ in WSL)
+# Try to load AMD GPU tools gracefully
 try:
     import pyamdgpuinfo
 
@@ -24,12 +26,23 @@ except ImportError:
     HAS_GPU = False
 
 
+def is_wsl() -> bool:
+    """Detects if the environment is running inside Windows Subsystem for Linux."""
+    return 'microsoft' in platform.release().lower()
+
+
 class HardwareMonitor:
     """Handles the stateful tracking of hardware metrics (especially network deltas)."""
 
     def __init__(self):
         self.last_net_io = psutil.net_io_counters()
         self.last_time = time.time()
+        self.cpu_history = deque([0] * 60, maxlen=60)
+        self.ram_history = deque([0] * 60, maxlen=60)
+
+    def update_history(self, cpu, ram):
+        self.cpu_history.append(cpu)
+        self.ram_history.append(ram)
 
     def format_bytes(self, size):
         """Converts raw bytes into human-readable formats (KB, MB, GB)."""
@@ -73,12 +86,11 @@ def generate_header() -> Panel:
     return Panel(table, style="bold white", border_style="blue")
 
 
-def generate_cpu_panel() -> Panel:
+def generate_cpu_panel(cpu_percentages) -> Panel:
     """Renders progress bars for every logical CPU core."""
-    cpu_percentages = psutil.cpu_percent(interval=None, percpu=True)
 
     progress = Progress(
-        TextColumn("[bold blue]Core {task.fields[core]}"),
+        TextColumn("[bold blue]Core {task.fields[core]:>2}"),
         BarColumn(bar_width=None, complete_style="green", finished_style="red"),
         TaskProgressColumn(),
         expand=True
@@ -97,7 +109,7 @@ def generate_cpu_panel() -> Panel:
     table.add_column()
     table.add_row(progress)
 
-    avg_cpu = sum(cpu_percentages) / len(cpu_percentages)
+    avg_cpu = sum(cpu_percentages) / len(cpu_percentages) if cpu_percentages else 0
     title = f" CPU Usage (Avg: {avg_cpu:.1f}%) "
     return Panel(table, title=title, border_style="cyan")
 
@@ -143,6 +155,11 @@ def generate_network_panel(monitor: HardwareMonitor) -> Panel:
 
 def generate_gpu_panel() -> Panel:
     """Renders GPU metrics specifically for AMD Radeon architecture."""
+    if is_wsl():
+        msg = "WSL Hypervisor Detected.\n\nRaw PCIe GPU sensors (Thermals/VRAM)\nare blocked by the Windows hypervisor.\n\nRun directly in Windows CMD/PowerShell\nto access hardware sensors."
+        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ",
+                     border_style="yellow")
+
     if not HAS_GPU:
         return Panel(Align.center(Text("No AMD GPU detected or drivers missing.", style="dim")), title=" GPU ",
                      border_style="red")
@@ -172,19 +189,103 @@ def generate_gpu_panel() -> Panel:
         return Panel(Align.center(Text(f"GPU Query Error: {e}", style="dim red")), title=" GPU ", border_style="red")
 
 
+# --- New Features: DB, Sparklines, & Processes ---
+
+def init_db():
+    """Initializes the SQLite database for historical metrics."""
+    conn = sqlite3.connect("system_metrics.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS metrics
+                   (
+                       id
+                       INTEGER
+                       PRIMARY
+                       KEY
+                       AUTOINCREMENT,
+                       timestamp
+                       DATETIME
+                       DEFAULT
+                       CURRENT_TIMESTAMP,
+                       cpu_percent
+                       REAL,
+                       ram_percent
+                       REAL
+                   )
+                   """)
+    conn.commit()
+    return conn
+
+
+def generate_sparkline(data_points):
+    """Converts a list of percentages into a unicode sparkline."""
+    bars = " ▂▃▄▅▆▇█"
+    line = ""
+    for p in data_points:
+        index = min(int((p or 0) / 12.5), 7)
+        line += bars[index]
+    return line
+
+
+def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
+    """Renders 60-second sparkline trends for CPU and RAM."""
+    cpu_spark = generate_sparkline(monitor.cpu_history)
+    ram_spark = generate_sparkline(monitor.ram_history)
+
+    table = Table.grid(padding=1, expand=True)
+    table.add_column("Resource", style="cyan", width=8)
+    table.add_column("Trend (Last 60s)", style="bold yellow")
+
+    table.add_row("CPU", cpu_spark)
+    table.add_row("RAM", ram_spark)
+
+    return Panel(table, title=" 📈 60-Second Trends ", border_style="blue")
+
+
+def generate_process_panel() -> Panel:
+    """Fetches and displays top 5 processes by memory usage."""
+    table = Table(expand=True, show_edge=False)
+    table.add_column("PID", style="dim")
+    table.add_column("Name", style="bold white")
+    table.add_column("Mem %", justify="right", style="magenta")
+    table.add_column("CPU %", justify="right", style="green")
+
+    processes = []
+    for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'cpu_percent']):
+        try:
+            pinfo = proc.info
+            if pinfo['memory_percent'] is not None:
+                processes.append(pinfo)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # Sort processes by memory usage
+    processes = sorted(processes, key=lambda p: p['memory_percent'] or 0, reverse=True)[:5]
+
+    for p in processes:
+        table.add_row(
+            str(p['pid']),
+            p['name'][:15],
+            f"{p['memory_percent']:.1f}%",
+            f"{p['cpu_percent']:.1f}%"
+        )
+    return Panel(table, title=" ⚙️ Top Processes (RAM) ", border_style="red")
+
+
 # --- Main Dashboard Setup ---
 
 def make_layout() -> Layout:
     """Defines the grid structure of the dashboard UI."""
     layout = Layout(name="root")
 
-    # Split into Top Header, Middle Body
-    layout.split(
+    # Split into Header, Main Body, and Lower Body
+    layout.split_column(
         Layout(name="header", size=3),
-        Layout(name="main", ratio=1)
+        Layout(name="main", ratio=2),
+        Layout(name="lower", ratio=1)
     )
 
-    # Split Body into Left and Right Columns
+    # Split Main Body into Left and Right Columns
     layout["main"].split_row(
         Layout(name="left"),
         Layout(name="right")
@@ -202,30 +303,56 @@ def make_layout() -> Layout:
         Layout(name="network", size=6)
     )
 
+    # Lower Body: Trends and Processes
+    layout["lower"].split_row(
+        Layout(name="trends", ratio=1),
+        Layout(name="processes", ratio=1)
+    )
+
     return layout
 
 
 def main():
+    db_conn = init_db()
     monitor = HardwareMonitor()
     layout = make_layout()
 
-    # Pre-warm psutil CPU counter to ensure accurate first reading
-    psutil.cpu_percent(interval=0.1)
+    # Pre-warm psutil CPU counter to prevent a 0.0% reading on first loop
+    psutil.cpu_percent(interval=0.1, percpu=True)
 
+    tick = 0
     # Initialize Live context manager (Runs the render loop automatically)
     with Live(layout, refresh_per_second=2, screen=True) as live:
         try:
             while True:
+                # 1. Gather Data & Update History
+                cpu_percentages = psutil.cpu_percent(interval=None, percpu=True)
+                current_cpu = sum(cpu_percentages) / len(cpu_percentages) if cpu_percentages else 0
+                current_ram = psutil.virtual_memory().percent
+
+                monitor.update_history(current_cpu, current_ram)
+
+                # 2. Log to DB every 5 seconds (10 ticks at 2 refreshes/sec)
+                if tick % 10 == 0:
+                    cursor = db_conn.cursor()
+                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)",
+                                   (current_cpu, current_ram))
+                    db_conn.commit()
+
+                # 3. Render UI components
                 layout["header"].update(generate_header())
-                layout["cpu"].update(generate_cpu_panel())
+                layout["cpu"].update(generate_cpu_panel(cpu_percentages))
                 layout["memory"].update(generate_memory_panel(monitor))
                 layout["network"].update(generate_network_panel(monitor))
                 layout["gpu"].update(generate_gpu_panel())
+                layout["trends"].update(generate_trend_panel(monitor))
+                layout["processes"].update(generate_process_panel())
 
+                tick += 1
                 time.sleep(0.5)  # Throttle to prevent consuming CPU to monitor CPU
         except KeyboardInterrupt:
             # Cleanly exit when user presses Ctrl+C
-            pass
+            db_conn.close()
 
 
 if __name__ == "__main__":
