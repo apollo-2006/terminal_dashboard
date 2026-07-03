@@ -13,27 +13,19 @@ from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn
 from rich.text import Text
 from rich.align import Align
 
-# Try to load AMD GPU tools gracefully
+# Try to load Windows GPU tools gracefully
 try:
-    import pyamdgpuinfo
-
-    try:
-        HAS_GPU = pyamdgpuinfo.detect_gpus() > 0
-    except Exception:
-        # Catches FileNotFoundError if /dev/dri/ is missing
-        HAS_GPU = False
+    import GPUtil
+    HAS_GPU = len(GPUtil.getGPUs()) > 0
 except ImportError:
     HAS_GPU = False
-
 
 def is_wsl() -> bool:
     """Detects if the environment is running inside Windows Subsystem for Linux."""
     return 'microsoft' in platform.release().lower()
 
-
 class HardwareMonitor:
     """Handles the stateful tracking of hardware metrics (especially network deltas)."""
-
     def __init__(self):
         self.last_net_io = psutil.net_io_counters()
         self.last_time = time.time()
@@ -46,7 +38,7 @@ class HardwareMonitor:
 
     def format_bytes(self, size):
         """Converts raw bytes into human-readable formats (KB, MB, GB)."""
-        power = 2 ** 10
+        power = 2**10
         n = 0
         power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
         while size > power:
@@ -68,7 +60,6 @@ class HardwareMonitor:
 
         return self.format_bytes(up_speed), self.format_bytes(down_speed)
 
-
 # --- UI Component Generators ---
 
 def generate_header() -> Panel:
@@ -84,7 +75,6 @@ def generate_header() -> Panel:
         Text(clock, style="bold magenta")
     )
     return Panel(table, style="bold white", border_style="blue")
-
 
 def generate_cpu_panel(cpu_percentages) -> Panel:
     """Renders progress bars for every logical CPU core."""
@@ -113,7 +103,6 @@ def generate_cpu_panel(cpu_percentages) -> Panel:
     title = f" CPU Usage (Avg: {avg_cpu:.1f}%) "
     return Panel(table, title=title, border_style="cyan")
 
-
 def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
     """Renders RAM and Swap usage."""
     mem = psutil.virtual_memory()
@@ -135,7 +124,6 @@ def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(progress, title=" Memory Information ", border_style="green")
 
-
 def generate_network_panel(monitor: HardwareMonitor) -> Panel:
     """Renders live upload/download network speeds."""
     up_speed, down_speed = monitor.get_network_speeds()
@@ -152,25 +140,22 @@ def generate_network_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(table, title=" Network I/O ", border_style="magenta")
 
-
 def generate_gpu_panel() -> Panel:
-    """Renders GPU metrics specifically for AMD Radeon architecture."""
+    """Renders GPU metrics using Windows-native GPUtil."""
     if is_wsl():
         msg = "WSL Hypervisor Detected.\n\nRaw PCIe GPU sensors (Thermals/VRAM)\nare blocked by the Windows hypervisor.\n\nRun directly in Windows CMD/PowerShell\nto access hardware sensors."
-        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ",
-                     border_style="yellow")
+        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ", border_style="yellow")
 
     if not HAS_GPU:
-        return Panel(Align.center(Text("No AMD GPU detected or drivers missing.", style="dim")), title=" GPU ",
-                     border_style="red")
+        return Panel(Align.center(Text("No GPU detected or drivers missing.", style="dim")), title=" GPU ", border_style="red")
 
     try:
-        gpu = pyamdgpuinfo.get_gpu(0)
+        gpu = GPUtil.getGPUs()[0]
 
-        load_percent = gpu.query_load() * 100
-        vram_used = gpu.query_vram_usage() / (1024 ** 2)
-        vram_total = gpu.memory_info['vram_size'] / (1024 ** 2)
-        temp = gpu.query_temperature()
+        load_percent = gpu.load * 100
+        vram_used = gpu.memoryUsed
+        vram_total = gpu.memoryTotal
+        temp = gpu.temperature
 
         table = Table(expand=True, show_edge=False)
         table.add_column("GPU", style="bold cyan")
@@ -179,7 +164,7 @@ def generate_gpu_panel() -> Panel:
         table.add_column("Temp", style="bold red")
 
         table.add_row(
-            gpu.name,
+            gpu.name[:15], # Truncate long names to fit panel
             f"{load_percent:.1f}%",
             f"{vram_used:.0f}MB / {vram_total:.0f}MB",
             f"{temp}°C"
@@ -188,7 +173,6 @@ def generate_gpu_panel() -> Panel:
     except Exception as e:
         return Panel(Align.center(Text(f"GPU Query Error: {e}", style="dim red")), title=" GPU ", border_style="red")
 
-
 # --- New Features: DB, Sparklines, & Processes ---
 
 def init_db():
@@ -196,36 +180,30 @@ def init_db():
     conn = sqlite3.connect("system_metrics.db")
     cursor = conn.cursor()
     cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS metrics
-                   (
-                       id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       timestamp
-                       DATETIME
-                       DEFAULT
-                       CURRENT_TIMESTAMP,
-                       cpu_percent
-                       REAL,
-                       ram_percent
-                       REAL
-                   )
-                   """)
+        CREATE TABLE IF NOT EXISTS metrics(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            cpu_percent REAL,
+            ram_percent REAL
+        )
+    """)
     conn.commit()
     return conn
 
-
 def generate_sparkline(data_points):
-    """Converts a list of percentages into a unicode sparkline."""
+    """Converts a list of percentages into a fixed-width unicode sparkline."""
     bars = " ▂▃▄▅▆▇█"
     line = ""
     for p in data_points:
-        index = min(int((p or 0) / 12.5), 7)
-        line += bars[index]
-    return line
+        if p == 0:  # Handle initial empty state
+            line += " "
+        else:
+            index = min(int((p or 0) / 12.5), 7)
+            line += bars[index]
 
+    # Force the string to always be exactly 60 characters wide
+    # This prevents the Rich layout from recalculating and jittering
+    return line.ljust(60, " ")
 
 def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     """Renders 60-second sparkline trends for CPU and RAM."""
@@ -240,7 +218,6 @@ def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     table.add_row("RAM", ram_spark)
 
     return Panel(table, title=" 📈 60-Second Trends ", border_style="blue")
-
 
 def generate_process_panel() -> Panel:
     """Fetches and displays top 5 processes by memory usage."""
@@ -270,7 +247,6 @@ def generate_process_panel() -> Panel:
             f"{p['cpu_percent']:.1f}%"
         )
     return Panel(table, title=" ⚙️ Top Processes (RAM) ", border_style="red")
-
 
 # --- Main Dashboard Setup ---
 
@@ -311,7 +287,6 @@ def make_layout() -> Layout:
 
     return layout
 
-
 def main():
     db_conn = init_db()
     monitor = HardwareMonitor()
@@ -335,8 +310,7 @@ def main():
                 # 2. Log to DB every 5 seconds (10 ticks at 2 refreshes/sec)
                 if tick % 10 == 0:
                     cursor = db_conn.cursor()
-                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)",
-                                   (current_cpu, current_ram))
+                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)", (current_cpu, current_ram))
                     db_conn.commit()
 
                 # 3. Render UI components
@@ -349,11 +323,19 @@ def main():
                 layout["processes"].update(generate_process_panel())
 
                 tick += 1
-                time.sleep(0.5)  # Throttle to prevent consuming CPU to monitor CPU
+                time.sleep(0.5) # Throttle to prevent consuming CPU to monitor CPU
         except KeyboardInterrupt:
             # Cleanly exit when user presses Ctrl+C
             db_conn.close()
 
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("\n" + "="*50)
+        print(" FATAL ERROR ENCOUNTERED")
+        print("="*50)
+        traceback.print_exc()
+        print("="*50)
+        input("\nPress Enter to close this window...")
