@@ -16,16 +16,20 @@ from rich.align import Align
 # Try to load Windows GPU tools gracefully
 try:
     import GPUtil
+
     HAS_GPU = len(GPUtil.getGPUs()) > 0
 except ImportError:
     HAS_GPU = False
+
 
 def is_wsl() -> bool:
     """Detects if the environment is running inside Windows Subsystem for Linux."""
     return 'microsoft' in platform.release().lower()
 
+
 class HardwareMonitor:
     """Handles the stateful tracking of hardware metrics (especially network deltas)."""
+
     def __init__(self):
         self.last_net_io = psutil.net_io_counters()
         self.last_time = time.time()
@@ -38,7 +42,7 @@ class HardwareMonitor:
 
     def format_bytes(self, size):
         """Converts raw bytes into human-readable formats (KB, MB, GB)."""
-        power = 2**10
+        power = 2 ** 10
         n = 0
         power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
         while size > power:
@@ -60,6 +64,7 @@ class HardwareMonitor:
 
         return self.format_bytes(up_speed), self.format_bytes(down_speed)
 
+
 # --- UI Component Generators ---
 
 def generate_header() -> Panel:
@@ -75,6 +80,7 @@ def generate_header() -> Panel:
         Text(clock, style="bold magenta")
     )
     return Panel(table, style="bold white", border_style="blue")
+
 
 def generate_cpu_panel(cpu_percentages) -> Panel:
     """Renders progress bars for every logical CPU core."""
@@ -103,6 +109,7 @@ def generate_cpu_panel(cpu_percentages) -> Panel:
     title = f" CPU Usage (Avg: {avg_cpu:.1f}%) "
     return Panel(table, title=title, border_style="cyan")
 
+
 def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
     """Renders RAM and Swap usage."""
     mem = psutil.virtual_memory()
@@ -124,6 +131,7 @@ def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(progress, title=" Memory Information ", border_style="green")
 
+
 def generate_network_panel(monitor: HardwareMonitor) -> Panel:
     """Renders live upload/download network speeds."""
     up_speed, down_speed = monitor.get_network_speeds()
@@ -140,38 +148,87 @@ def generate_network_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(table, title=" Network I/O ", border_style="magenta")
 
+
+import subprocess
+import json
+
+
 def generate_gpu_panel() -> Panel:
-    """Renders GPU metrics using Windows-native GPUtil."""
+    """Attempts to manually fetch AMD/Intel GPU info using Windows WMI via PowerShell."""
     if is_wsl():
         msg = "WSL Hypervisor Detected.\n\nRaw PCIe GPU sensors (Thermals/VRAM)\nare blocked by the Windows hypervisor.\n\nRun directly in Windows CMD/PowerShell\nto access hardware sensors."
-        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ", border_style="yellow")
+        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ",
+                     border_style="yellow")
 
-    if not HAS_GPU:
-        return Panel(Align.center(Text("No GPU detected or drivers missing.", style="dim")), title=" GPU ", border_style="red")
+    if HAS_GPU:
+        try:
+            gpu = GPUtil.getGPUs()[0]
 
+            load_percent = gpu.load * 100
+            vram_used = gpu.memoryUsed
+            vram_total = gpu.memoryTotal
+            temp = gpu.temperature
+
+            table = Table(expand=True, show_edge=False)
+            table.add_column("GPU", style="bold cyan")
+            table.add_column("Load", style="bold yellow")
+            table.add_column("VRAM", style="bold green")
+            table.add_column("Temp", style="bold red")
+
+            table.add_row(
+                gpu.name[:15],
+                f"{load_percent:.1f}%",
+                f"{vram_used:.0f}MB / {vram_total:.0f}MB",
+                f"{temp}°C"
+            )
+            return Panel(table, title=" GPU Information ", border_style="yellow")
+        except Exception:
+            pass  # Fallback to manual WMI
+
+    # Manual Windows Fallback for AMD / Intel
     try:
-        gpu = GPUtil.getGPUs()[0]
+        # Query Windows directly for GPU hardware info (Zero-dependency)
+        cmd = ['powershell', '-NoProfile', '-Command',
+               'Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json']
 
-        load_percent = gpu.load * 100
-        vram_used = gpu.memoryUsed
-        vram_total = gpu.memoryTotal
-        temp = gpu.temperature
+        # Prevent empty black terminal popups when running as an .exe
+        flags = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+
+        if not result.stdout.strip():
+            return Panel(Align.center(Text("No GPU detected.", style="dim")), title=" GPU ", border_style="red")
+
+        data = json.loads(result.stdout)
+        if isinstance(data, list):
+            data = data[0]  # Grab primary GPU if multiple exist
+
+        gpu_name = data.get('Name', 'Unknown AMD/Intel GPU')
+        vram_bytes = data.get('AdapterRAM', 0)
+
+        # WMI often caps AdapterRAM at 4GB (4294967296 bytes) due to legacy 32-bit limits
+        vram_gb = vram_bytes / (1024 ** 3) if vram_bytes else 0
+        vram_display = f"{vram_gb:.1f} GB" if vram_bytes else "N/A"
+        if vram_bytes == 4294967296:
+            vram_display = "4.0+ GB (WMI Capped)"
 
         table = Table(expand=True, show_edge=False)
         table.add_column("GPU", style="bold cyan")
-        table.add_column("Load", style="bold yellow")
+        table.add_column("Load", style="dim yellow")
         table.add_column("VRAM", style="bold green")
-        table.add_column("Temp", style="bold red")
+        table.add_column("Temp", style="dim red")
 
         table.add_row(
-            gpu.name[:15], # Truncate long names to fit panel
-            f"{load_percent:.1f}%",
-            f"{vram_used:.0f}MB / {vram_total:.0f}MB",
-            f"{temp}°C"
+            gpu_name[:18],  # Truncate long names
+            "OS Locked",  # Windows blocks real-time 3D load from standard WMI
+            vram_display,
+            "Req. SDK"  # Thermals require proprietary AMD DLLs
         )
-        return Panel(table, title=" GPU Information ", border_style="yellow")
+        return Panel(table, title=" GPU Info (WMI Fallback) ", border_style="cyan")
+
     except Exception as e:
-        return Panel(Align.center(Text(f"GPU Query Error: {e}", style="dim red")), title=" GPU ", border_style="red")
+        return Panel(Align.center(Text(f"Manual GPU Query Error: {e}", style="dim red")), title=" GPU ",
+                     border_style="red")
+
 
 # --- New Features: DB, Sparklines, & Processes ---
 
@@ -180,30 +237,43 @@ def init_db():
     conn = sqlite3.connect("system_metrics.db")
     cursor = conn.cursor()
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS metrics(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            cpu_percent REAL,
-            ram_percent REAL
-        )
-    """)
+                   CREATE TABLE IF NOT EXISTS metrics
+                   (
+                       id
+                       INTEGER
+                       PRIMARY
+                       KEY
+                       AUTOINCREMENT,
+                       timestamp
+                       DATETIME
+                       DEFAULT
+                       CURRENT_TIMESTAMP,
+                       cpu_percent
+                       REAL,
+                       ram_percent
+                       REAL
+                   )
+                   """)
     conn.commit()
     return conn
 
+
 def generate_sparkline(data_points):
-    """Converts a list of percentages into a fixed-width unicode sparkline."""
-    bars = " ▂▃▄▅▆▇█"
+    """Converts a list of percentages into a fixed-width, Windows-safe ASCII sparkline."""
+    # Using standard ASCII characters guaranteed to render correctly in all Windows fonts
+    bars = " .|:-=+*#%@"
     line = ""
     for p in data_points:
-        if p == 0:  # Handle initial empty state
+        if p == 0:
             line += " "
         else:
-            index = min(int((p or 0) / 12.5), 7)
+            # Map 0-100 to the 10 characters in 'bars' (excluding the first space)
+            index = min(int((p or 0) / 10), 9) + 1
             line += bars[index]
 
     # Force the string to always be exactly 60 characters wide
-    # This prevents the Rich layout from recalculating and jittering
     return line.ljust(60, " ")
+
 
 def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     """Renders 60-second sparkline trends for CPU and RAM."""
@@ -218,6 +288,7 @@ def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     table.add_row("RAM", ram_spark)
 
     return Panel(table, title=" 📈 60-Second Trends ", border_style="blue")
+
 
 def generate_process_panel() -> Panel:
     """Fetches and displays top 5 processes by memory usage."""
@@ -247,6 +318,7 @@ def generate_process_panel() -> Panel:
             f"{p['cpu_percent']:.1f}%"
         )
     return Panel(table, title=" ⚙️ Top Processes (RAM) ", border_style="red")
+
 
 # --- Main Dashboard Setup ---
 
@@ -287,6 +359,7 @@ def make_layout() -> Layout:
 
     return layout
 
+
 def main():
     db_conn = init_db()
     monitor = HardwareMonitor()
@@ -310,7 +383,8 @@ def main():
                 # 2. Log to DB every 5 seconds (10 ticks at 2 refreshes/sec)
                 if tick % 10 == 0:
                     cursor = db_conn.cursor()
-                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)", (current_cpu, current_ram))
+                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)",
+                                   (current_cpu, current_ram))
                     db_conn.commit()
 
                 # 3. Render UI components
@@ -323,17 +397,19 @@ def main():
                 layout["processes"].update(generate_process_panel())
 
                 tick += 1
-                time.sleep(0.5) # Throttle to prevent consuming CPU to monitor CPU
+                time.sleep(0.5)  # Throttle to prevent consuming CPU to monitor CPU
         except KeyboardInterrupt:
             # Cleanly exit when user presses Ctrl+C
             db_conn.close()
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         import traceback
-        print("\n" + "="*50)
+
+        print("\n" + "=" * 50)
         print(" FATAL ERROR ENCOUNTERED")
         print("="*50)
         traceback.print_exc()
