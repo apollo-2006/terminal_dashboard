@@ -16,20 +16,23 @@ from rich.align import Align
 # Try to load Windows GPU tools gracefully
 try:
     import GPUtil
-
     HAS_GPU = len(GPUtil.getGPUs()) > 0
 except ImportError:
     HAS_GPU = False
 
+# Try to load requests for LibreHardwareMonitor's web server (real AMD/Intel sensor data)
+try:
+    import requests
+    HAS_LHM_WEB = True
+except ImportError:
+    HAS_LHM_WEB = False
 
 def is_wsl() -> bool:
     """Detects if the environment is running inside Windows Subsystem for Linux."""
     return 'microsoft' in platform.release().lower()
 
-
 class HardwareMonitor:
     """Handles the stateful tracking of hardware metrics (especially network deltas)."""
-
     def __init__(self):
         self.last_net_io = psutil.net_io_counters()
         self.last_time = time.time()
@@ -42,7 +45,7 @@ class HardwareMonitor:
 
     def format_bytes(self, size):
         """Converts raw bytes into human-readable formats (KB, MB, GB)."""
-        power = 2 ** 10
+        power = 2**10
         n = 0
         power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
         while size > power:
@@ -64,7 +67,6 @@ class HardwareMonitor:
 
         return self.format_bytes(up_speed), self.format_bytes(down_speed)
 
-
 # --- UI Component Generators ---
 
 def generate_header() -> Panel:
@@ -80,7 +82,6 @@ def generate_header() -> Panel:
         Text(clock, style="bold magenta")
     )
     return Panel(table, style="bold white", border_style="blue")
-
 
 def generate_cpu_panel(cpu_percentages) -> Panel:
     """Renders progress bars for every logical CPU core."""
@@ -109,7 +110,6 @@ def generate_cpu_panel(cpu_percentages) -> Panel:
     title = f" CPU Usage (Avg: {avg_cpu:.1f}%) "
     return Panel(table, title=title, border_style="cyan")
 
-
 def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
     """Renders RAM and Swap usage."""
     mem = psutil.virtual_memory()
@@ -131,7 +131,6 @@ def generate_memory_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(progress, title=" Memory Information ", border_style="green")
 
-
 def generate_network_panel(monitor: HardwareMonitor) -> Panel:
     """Renders live upload/download network speeds."""
     up_speed, down_speed = monitor.get_network_speeds()
@@ -148,18 +147,145 @@ def generate_network_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(table, title=" Network I/O ", border_style="magenta")
 
-
 import subprocess
 import json
 
+# --- LibreHardwareMonitor sensor bridge (via built-in web server) ---
+#
+# Standard WMI (Win32_VideoController) only exposes a static hardware inventory:
+# no live load, no temp, and AdapterRAM is a 32-bit field that hard-caps at 4GB
+# regardless of actual VRAM. WMI namespace registration for LHM's own provider
+# also turned out to be broken on this machine (target namespace didn't exist),
+# so instead we use LHM's built-in web server, which is simpler and just as live.
+#
+# Setup required:
+#   1. pip install requests
+#   2. In LibreHardwareMonitor: Options menu -> check "Remote Web Server"
+#      (default port 8085). Leave LHM running as Administrator in the background.
+#   3. Verify it works by opening http://localhost:8085/data.json in a browser.
+#
+# The JSON is a tree (Text/Children). We find the node whose HardwareId starts
+# with "/gpu-amd" (confirmed via a live data.json pull), then read specific
+# child sensors by their exact Text label under each category group.
+
+LHM_URL = "http://localhost:8085/data.json"
+
+def _find_node_by_hardware_id_prefix(node, prefix):
+    """Recursively searches the LHM sensor tree for a node whose HardwareId starts with prefix."""
+    if node.get("HardwareId", "").startswith(prefix):
+        return node
+    for child in node.get("Children", []):
+        found = _find_node_by_hardware_id_prefix(child, prefix)
+        if found is not None:
+            return found
+    return None
+
+def _find_child_value(node, group_text, target_text):
+    """Within a hardware node, finds Children[group_text].Children[target_text].Value."""
+    for group in node.get("Children", []):
+        if group.get("Text") == group_text:
+            for leaf in group.get("Children", []):
+                if leaf.get("Text") == target_text:
+                    return leaf.get("Value", "")
+    return None
+
+def _parse_number(raw_value):
+    """Strips units like '°C', '%', 'W', 'MB' from an LHM value string and returns a float."""
+    if not raw_value:
+        return None
+    try:
+        return float(raw_value.split(" ")[0])
+    except (ValueError, IndexError):
+        return None
+
+def get_lhm_gpu_sensors():
+    """Pulls live GPU sensor data from LibreHardwareMonitor's web server."""
+    resp = requests.get(LHM_URL, timeout=1)
+    resp.raise_for_status()
+    root = resp.json()
+
+    gpu_node = _find_node_by_hardware_id_prefix(root, "/gpu-amd")
+    if gpu_node is None:
+        return None
+
+    data = {
+        "name": gpu_node.get("Text", "AMD GPU"),
+        "temp": _parse_number(_find_child_value(gpu_node, "Temperatures", "GPU Core")),
+        "hotspot": _parse_number(_find_child_value(gpu_node, "Temperatures", "GPU Hot Spot")),
+        "load": _parse_number(_find_child_value(gpu_node, "Load", "GPU Core")),
+        "power": _parse_number(_find_child_value(gpu_node, "Powers", "GPU Package")),
+        "vram_used": _parse_number(_find_child_value(gpu_node, "Data", "GPU Memory Used")),
+        "vram_total": _parse_number(_find_child_value(gpu_node, "Data", "GPU Memory Total")),
+    }
+
+    return data if data["temp"] is not None else None
+
+def generate_gpu_panel_lhm(sensor_data) -> Panel:
+    """Renders GPU panel from real LibreHardwareMonitor sensor data."""
+    table = Table(expand=True, show_edge=False)
+    table.add_column("GPU", style="bold cyan")
+    table.add_column("Load", style="bold yellow")
+    table.add_column("VRAM", style="bold green")
+    table.add_column("Temp", style="bold red")
+    table.add_column("Hot Spot", style="bold red")
+    table.add_column("Power", style="bold magenta")
+
+    name = (sensor_data["name"] or "AMD GPU")[:20]
+    load_str = f"{sensor_data['load']:.1f}%" if sensor_data["load"] is not None else "N/A"
+    temp_str = f"{sensor_data['temp']:.0f}°C" if sensor_data["temp"] is not None else "N/A"
+    hotspot_str = f"{sensor_data['hotspot']:.0f}°C" if sensor_data.get("hotspot") is not None else "N/A"
+    power_str = f"{sensor_data['power']:.0f}W" if sensor_data["power"] is not None else "N/A"
+
+    if sensor_data["vram_used"] is not None and sensor_data["vram_total"] is not None:
+        vram_str = f"{sensor_data['vram_used']:.0f}MB / {sensor_data['vram_total']:.0f}MB"
+    else:
+        vram_str = "N/A"
+
+    table.add_row(name, load_str, vram_str, temp_str, hotspot_str, power_str)
+
+    # Color the border based on hot spot temp (more sensitive early-warning signal than core temp)
+    border = "green"
+    reference_temp = sensor_data.get("hotspot") or sensor_data.get("temp")
+    if reference_temp is not None:
+        if reference_temp > 85:
+            border = "yellow"
+        if reference_temp > 100:
+            border = "red"
+
+    return Panel(table, title=" GPU Information (LibreHardwareMonitor) ", border_style=border)
 
 def generate_gpu_panel() -> Panel:
-    """Attempts to manually fetch AMD/Intel GPU info using Windows WMI via PowerShell."""
+    """
+    Fetches GPU info, preferring real sensor data in this order:
+    1. LibreHardwareMonitor via WMI (real temp/load/vram/power for AMD/Intel/Nvidia)
+    2. GPUtil (Nvidia only)
+    3. Manual Win32_VideoController WMI fallback (static info only, VRAM capped at 4GB)
+    """
     if is_wsl():
         msg = "WSL Hypervisor Detected.\n\nRaw PCIe GPU sensors (Thermals/VRAM)\nare blocked by the Windows hypervisor.\n\nRun directly in Windows CMD/PowerShell\nto access hardware sensors."
-        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ",
-                     border_style="yellow")
+        return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ", border_style="yellow")
 
+    # 1. Try LibreHardwareMonitor's web server first — this is the real fix for AMD sensors
+    if HAS_LHM_WEB:
+        try:
+            lhm_data = get_lhm_gpu_sensors()
+            if lhm_data is not None:
+                return generate_gpu_panel_lhm(lhm_data)
+        except Exception as e:
+            # Log the real reason instead of silently falling through, so this is debuggable
+            try:
+                with open("gpu_debug.log", "a") as f:
+                    f.write(f"{datetime.now()} LHM web fetch failed: {type(e).__name__}: {e}\n")
+            except Exception:
+                pass
+    elif not HAS_LHM_WEB:
+        try:
+            with open("gpu_debug.log", "a") as f:
+                f.write(f"{datetime.now()} 'requests' module not available in this build\n")
+        except Exception:
+            pass
+
+    # 2. Nvidia via GPUtil
     if HAS_GPU:
         try:
             gpu = GPUtil.getGPUs()[0]
@@ -185,13 +311,10 @@ def generate_gpu_panel() -> Panel:
         except Exception:
             pass  # Fallback to manual WMI
 
-    # Manual Windows Fallback for AMD / Intel
+    # 3. Manual Windows Fallback for AMD / Intel (static info only — VRAM capped at 4GB by WMI)
     try:
-        # Query Windows directly for GPU hardware info (Zero-dependency)
-        cmd = ['powershell', '-NoProfile', '-Command',
-               'Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json']
+        cmd = ['powershell', '-NoProfile', '-Command', 'Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json']
 
-        # Prevent empty black terminal popups when running as an .exe
         flags = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
         result = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
 
@@ -205,11 +328,11 @@ def generate_gpu_panel() -> Panel:
         gpu_name = data.get('Name', 'Unknown AMD/Intel GPU')
         vram_bytes = data.get('AdapterRAM', 0)
 
-        # WMI often caps AdapterRAM at 4GB (4294967296 bytes) due to legacy 32-bit limits
-        vram_gb = vram_bytes / (1024 ** 3) if vram_bytes else 0
+        vram_gb = vram_bytes / (1024**3) if vram_bytes else 0
         vram_display = f"{vram_gb:.1f} GB" if vram_bytes else "N/A"
-        if vram_bytes == 4294967296:
-            vram_display = "4.0+ GB (WMI Capped)"
+
+        if vram_bytes == 4294967296 or vram_bytes == 4294967295:
+            vram_display = "4.0+ GB (WMI Capped — install LibreHardwareMonitor for real VRAM)"
 
         table = Table(expand=True, show_edge=False)
         table.add_column("GPU", style="bold cyan")
@@ -218,17 +341,15 @@ def generate_gpu_panel() -> Panel:
         table.add_column("Temp", style="dim red")
 
         table.add_row(
-            gpu_name[:18],  # Truncate long names
-            "OS Locked",  # Windows blocks real-time 3D load from standard WMI
+            gpu_name[:22],
+            "OS Locked",
             vram_display,
-            "Req. SDK"  # Thermals require proprietary AMD DLLs
+            "Req. LHM"
         )
-        return Panel(table, title=" GPU Info (WMI Fallback) ", border_style="cyan")
+        return Panel(table, title=" GPU Info (WMI Fallback — install LibreHardwareMonitor) ", border_style="cyan")
 
     except Exception as e:
-        return Panel(Align.center(Text(f"Manual GPU Query Error: {e}", style="dim red")), title=" GPU ",
-                     border_style="red")
-
+        return Panel(Align.center(Text(f"Manual GPU Query Error: {e}", style="dim red")), title=" GPU ", border_style="red")
 
 # --- New Features: DB, Sparklines, & Processes ---
 
@@ -237,43 +358,28 @@ def init_db():
     conn = sqlite3.connect("system_metrics.db")
     cursor = conn.cursor()
     cursor.execute("""
-                   CREATE TABLE IF NOT EXISTS metrics
-                   (
-                       id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       timestamp
-                       DATETIME
-                       DEFAULT
-                       CURRENT_TIMESTAMP,
-                       cpu_percent
-                       REAL,
-                       ram_percent
-                       REAL
-                   )
-                   """)
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            cpu_percent REAL,
+            ram_percent REAL
+        )
+    """)
     conn.commit()
     return conn
 
-
 def generate_sparkline(data_points):
     """Converts a list of percentages into a fixed-width, Windows-safe ASCII sparkline."""
-    # Using standard ASCII characters guaranteed to render correctly in all Windows fonts
     bars = " .|:-=+*#%@"
     line = ""
     for p in data_points:
         if p == 0:
             line += " "
         else:
-            # Map 0-100 to the 10 characters in 'bars' (excluding the first space)
             index = min(int((p or 0) / 10), 9) + 1
             line += bars[index]
 
-    # Force the string to always be exactly 60 characters wide
     return line.ljust(60, " ")
-
 
 def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     """Renders 60-second sparkline trends for CPU and RAM."""
@@ -288,7 +394,6 @@ def generate_trend_panel(monitor: HardwareMonitor) -> Panel:
     table.add_row("RAM", ram_spark)
 
     return Panel(table, title=" 📈 60-Second Trends ", border_style="blue")
-
 
 def generate_process_panel() -> Panel:
     """Fetches and displays top 5 processes by memory usage."""
@@ -307,7 +412,6 @@ def generate_process_panel() -> Panel:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # Sort processes by memory usage
     processes = sorted(processes, key=lambda p: p['memory_percent'] or 0, reverse=True)[:5]
 
     for p in processes:
@@ -319,39 +423,33 @@ def generate_process_panel() -> Panel:
         )
     return Panel(table, title=" ⚙️ Top Processes (RAM) ", border_style="red")
 
-
 # --- Main Dashboard Setup ---
 
 def make_layout() -> Layout:
     """Defines the grid structure of the dashboard UI."""
     layout = Layout(name="root")
 
-    # Split into Header, Main Body, and Lower Body
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main", ratio=2),
         Layout(name="lower", ratio=1)
     )
 
-    # Split Main Body into Left and Right Columns
     layout["main"].split_row(
         Layout(name="left"),
         Layout(name="right")
     )
 
-    # Left Column: CPU & Memory
     layout["left"].split_column(
         Layout(name="cpu", ratio=2),
         Layout(name="memory", size=6)
     )
 
-    # Right Column: GPU & Network
     layout["right"].split_column(
         Layout(name="gpu", ratio=1),
         Layout(name="network", size=6)
     )
 
-    # Lower Body: Trends and Processes
     layout["lower"].split_row(
         Layout(name="trends", ratio=1),
         Layout(name="processes", ratio=1)
@@ -359,35 +457,28 @@ def make_layout() -> Layout:
 
     return layout
 
-
 def main():
     db_conn = init_db()
     monitor = HardwareMonitor()
     layout = make_layout()
 
-    # Pre-warm psutil CPU counter to prevent a 0.0% reading on first loop
     psutil.cpu_percent(interval=0.1, percpu=True)
 
     tick = 0
-    # Initialize Live context manager (Runs the render loop automatically)
     with Live(layout, refresh_per_second=2, screen=True) as live:
         try:
             while True:
-                # 1. Gather Data & Update History
                 cpu_percentages = psutil.cpu_percent(interval=None, percpu=True)
                 current_cpu = sum(cpu_percentages) / len(cpu_percentages) if cpu_percentages else 0
                 current_ram = psutil.virtual_memory().percent
 
                 monitor.update_history(current_cpu, current_ram)
 
-                # 2. Log to DB every 5 seconds (10 ticks at 2 refreshes/sec)
                 if tick % 10 == 0:
                     cursor = db_conn.cursor()
-                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)",
-                                   (current_cpu, current_ram))
+                    cursor.execute("INSERT INTO metrics (cpu_percent, ram_percent) VALUES (?, ?)", (current_cpu, current_ram))
                     db_conn.commit()
 
-                # 3. Render UI components
                 layout["header"].update(generate_header())
                 layout["cpu"].update(generate_cpu_panel(cpu_percentages))
                 layout["memory"].update(generate_memory_panel(monitor))
@@ -397,19 +488,16 @@ def main():
                 layout["processes"].update(generate_process_panel())
 
                 tick += 1
-                time.sleep(0.5)  # Throttle to prevent consuming CPU to monitor CPU
+                time.sleep(0.5)
         except KeyboardInterrupt:
-            # Cleanly exit when user presses Ctrl+C
             db_conn.close()
-
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         import traceback
-
-        print("\n" + "=" * 50)
+        print("\n" + "="*50)
         print(" FATAL ERROR ENCOUNTERED")
         print("="*50)
         traceback.print_exc()

@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# extra for exe building
+dist/
+build/
+*.spec
+*.exe
