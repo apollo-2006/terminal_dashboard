@@ -1,36 +1,59 @@
-# terminal_dashboard
-A live, terminal-based hardware monitor written in Python. Renders real-time CPU, RAM, GPU, and network metrics in a clean dashboard UI — built as a more capable, visually driven alternative to htop.
+# TerminalDash
+
+A real-time system monitoring dashboard that runs right in your terminal. Built with Python and [Rich](https://github.com/Textualize/rich), it gives you a live view of your CPU, memory, network, GPU, and top processes — no browser tab, no bloated GUI app.
+
+![Windows](https://img.shields.io/badge/platform-Windows-blue)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 
 ## Features
-* **CPU Monitoring**: Per-core usage displayed as live progress bars with average load tracking.
-* **Memory Tracking**: Real-time RAM and Swap usage with human-readable byte formatting.
-* **AMD GPU Support**: Pulls live GPU load, VRAM usage, and temperature via `pyamdgpuinfo` for Radeon architecture.
-* **Network I/O**: Calculates live upload/download speeds using time-delta polling, with total transfer counters.
-* **Rich Terminal UI**: Full dashboard layout powered by the `rich` library with a live refresh loop.
 
-## Build & Run
+- **Per-core CPU usage** with color-coded load bars (green → yellow → red)
+- **Memory & swap** usage with live GB counters
+- **Network I/O** — real-time upload/download speed and session totals
+- **GPU monitoring** — live temperature, hot spot temp, load, power draw, and VRAM usage for AMD GPUs (via LibreHardwareMonitor), with automatic fallback for other setups
+- **60-second sparkline trends** for CPU and RAM history
+- **Top 5 processes** by RAM usage
+- **SQLite logging** — CPU/RAM history is persisted to `system_metrics.db` for later analysis
+
+## Download
+
+Grab the latest pre-built `.exe` from the [Releases page](../../releases/latest) — no Python install needed.
+
+> **Note:** Since this is an unsigned executable, Windows SmartScreen may show a "Windows protected your PC" warning on first launch. Click **More info → Run anyway** to proceed.
+
+## GPU Monitoring Setup (AMD GPUs)
+
+Standard Windows APIs don't expose real GPU sensor data for AMD cards (no live temp/load, and VRAM reporting is capped at 4GB). To get real numbers, TerminalDash reads from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)'s built-in web server:
+
+1. Download and run **LibreHardwareMonitor** as Administrator
+2. In the **Options** menu, enable **Remote Web Server** (default port 8085)
+3. Leave it running in the background, then launch TerminalDash
+
+If LibreHardwareMonitor isn't running, TerminalDash automatically falls back to basic Windows WMI data (static info only, no live temps/load).
+
+## Running from Source
+
 ```bash
-# Clone the repository
-git clone https://github.com/apollo-2006/terminal_dashboard.git
-cd terminal_dashboard
-
-# Create and activate a virtual environment (optional but recommended)
-python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
-
-# Install dependencies
+git clone https://github.com/yourusername/terminaldash.git
+cd terminaldash
 pip install -r requirements.txt
-
-# Run the dashboard
-python3 dashboard.py
+python dashboard.py
 ```
 
-Press `Ctrl+C` to exit cleanly.
+### Building the executable
 
-## Dependencies
-* `psutil`
-* `rich`
-* `pyamdgpuinfo`
+```bash
+python -m PyInstaller --onefile --hidden-import=GPUtil --hidden-import=requests --hidden-import=charset_normalizer --hidden-import=idna --hidden-import=certifi --name TerminalDash dashboard.py
+```
 
-## Author
-**Abir Deol**
+The compiled `.exe` will be in the `dist/` folder.
+
+## Requirements
+
+- Windows 10/11
+- Python 3.10+ (only needed if running/building from source)
+- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for real GPU sensor data on AMD cards)
+
+## License
+
+MIT
