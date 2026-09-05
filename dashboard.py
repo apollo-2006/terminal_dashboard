@@ -2,6 +2,8 @@ import psutil
 import time
 import platform
 import sqlite3
+import subprocess
+import json
 from collections import deque
 from datetime import datetime
 
@@ -16,8 +18,10 @@ from rich.align import Align
 # Try to load Windows GPU tools gracefully
 try:
     import GPUtil
+    # getGPUs() shells out to nvidia-smi and raises a variety of things when it
+    # is missing or the driver is unhappy, not just ImportError.
     HAS_GPU = len(GPUtil.getGPUs()) > 0
-except ImportError:
+except Exception:
     HAS_GPU = False
 
 # Try to load requests for LibreHardwareMonitor's web server (real AMD/Intel sensor data)
@@ -48,16 +52,19 @@ class HardwareMonitor:
         power = 2**10
         n = 0
         power_labels = {0: 'B', 1: 'KB', 2: 'MB', 3: 'GB', 4: 'TB'}
-        while size > power:
+        # Stop at the largest label we have. Running past it used to fall through
+        # to .get(n, 'B') and report petabytes as bytes.
+        while size >= power and n < max(power_labels):
             size /= power
             n += 1
-        return f"{size:.2f} {power_labels.get(n, 'B')}"
+        return f"{size:.2f} {power_labels[n]}"
 
     def get_network_speeds(self):
         """Calculates exact upload/download speeds based on time deltas."""
         now = time.time()
         current_net_io = psutil.net_io_counters()
-        dt = now - self.last_time
+        # Two calls inside the same clock tick would divide by zero
+        dt = max(now - self.last_time, 1e-6)
 
         up_speed = (current_net_io.bytes_sent - self.last_net_io.bytes_sent) / dt
         down_speed = (current_net_io.bytes_recv - self.last_net_io.bytes_recv) / dt
@@ -88,18 +95,22 @@ def generate_cpu_panel(cpu_percentages) -> Panel:
 
     progress = Progress(
         TextColumn("[bold blue]Core {task.fields[core]:>2}"),
-        BarColumn(bar_width=None, complete_style="green", finished_style="red"),
+        BarColumn(bar_width=None),
         TaskProgressColumn(),
         expand=True
     )
 
     for i, percent in enumerate(cpu_percentages):
-        # Color shift: Green -> Yellow -> Red based on load
+        # Color shift: Green -> Yellow -> Red based on load.
+        # The style has to go on the task, not the shared BarColumn: a single
+        # complete_style on the column paints every core the same colour, so the
+        # value computed here used to be discarded and all bars stayed green.
         color = "green"
         if percent > 60: color = "yellow"
         if percent > 85: color = "red"
 
-        progress.add_task("cpu", total=100, completed=percent, core=i)
+        progress.add_task("cpu", total=100, completed=percent, core=i,
+                          style="grey23", complete_style=color, finished_style=color)
 
     # Use a grid layout to format multiple cores nicely
     table = Table.grid(expand=True)
@@ -147,9 +158,6 @@ def generate_network_panel(monitor: HardwareMonitor) -> Panel:
 
     return Panel(table, title=" Network I/O ", border_style="magenta")
 
-import subprocess
-import json
-
 # --- LibreHardwareMonitor sensor bridge (via built-in web server) ---
 #
 # Standard WMI (Win32_VideoController) only exposes a static hardware inventory:
@@ -169,6 +177,35 @@ import json
 # child sensors by their exact Text label under each category group.
 
 LHM_URL = "http://localhost:8085/data.json"
+
+# The dashboard repaints twice a second, but GPU sensors do not need polling that
+# fast and an HTTP round trip per frame is wasteful when LHM is up and a 1 second
+# stall per frame when it is not. Sensors are refreshed at most this often and the
+# last reading is reused in between.
+GPU_POLL_INTERVAL = 2.0
+
+# When the LHM fetch fails it used to append a line to gpu_debug.log on every
+# frame, so a session with LHM closed grew the file by two lines a second
+# indefinitely. Failures are now logged once per distinct reason, then throttled.
+GPU_LOG_INTERVAL = 60.0
+
+_gpu_cache = {"panel": None, "fetched_at": 0.0}
+_gpu_log_state = {"last_message": None, "last_logged_at": 0.0}
+
+
+def _log_gpu_debug(message):
+    """Appends to gpu_debug.log, but only when the reason changed or a minute passed."""
+    now = time.time()
+    if (message == _gpu_log_state["last_message"]
+            and now - _gpu_log_state["last_logged_at"] < GPU_LOG_INTERVAL):
+        return
+    _gpu_log_state["last_message"] = message
+    _gpu_log_state["last_logged_at"] = now
+    try:
+        with open("gpu_debug.log", "a") as f:
+            f.write(f"{datetime.now()} {message}\n")
+    except OSError:
+        pass
 
 def _find_node_by_hardware_id_prefix(node, prefix):
     """Recursively searches the LHM sensor tree for a node whose HardwareId starts with prefix."""
@@ -256,8 +293,24 @@ def generate_gpu_panel_lhm(sensor_data) -> Panel:
 
 def generate_gpu_panel() -> Panel:
     """
+    Returns the GPU panel, refreshing the underlying sensors at most every
+    GPU_POLL_INTERVAL seconds and reusing the last panel in between.
+    """
+    now = time.time()
+    if (_gpu_cache["panel"] is not None
+            and now - _gpu_cache["fetched_at"] < GPU_POLL_INTERVAL):
+        return _gpu_cache["panel"]
+
+    panel = _build_gpu_panel()
+    _gpu_cache["panel"] = panel
+    _gpu_cache["fetched_at"] = now
+    return panel
+
+
+def _build_gpu_panel() -> Panel:
+    """
     Fetches GPU info, preferring real sensor data in this order:
-    1. LibreHardwareMonitor via WMI (real temp/load/vram/power for AMD/Intel/Nvidia)
+    1. LibreHardwareMonitor via its web server (real temp/load/vram/power)
     2. GPUtil (Nvidia only)
     3. Manual Win32_VideoController WMI fallback (static info only, VRAM capped at 4GB)
     """
@@ -273,17 +326,9 @@ def generate_gpu_panel() -> Panel:
                 return generate_gpu_panel_lhm(lhm_data)
         except Exception as e:
             # Log the real reason instead of silently falling through, so this is debuggable
-            try:
-                with open("gpu_debug.log", "a") as f:
-                    f.write(f"{datetime.now()} LHM web fetch failed: {type(e).__name__}: {e}\n")
-            except Exception:
-                pass
-    elif not HAS_LHM_WEB:
-        try:
-            with open("gpu_debug.log", "a") as f:
-                f.write(f"{datetime.now()} 'requests' module not available in this build\n")
-        except Exception:
-            pass
+            _log_gpu_debug(f"LHM web fetch failed: {type(e).__name__}: {e}")
+    else:
+        _log_gpu_debug("'requests' module not available in this build")
 
     # 2. Nvidia via GPUtil
     if HAS_GPU:
@@ -490,6 +535,10 @@ def main():
                 tick += 1
                 time.sleep(0.5)
         except KeyboardInterrupt:
+            pass
+        finally:
+            # Previously only the Ctrl-C path closed the connection, so any other
+            # exception left the last writes unflushed.
             db_conn.close()
 
 if __name__ == "__main__":
