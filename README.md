@@ -1,6 +1,6 @@
 # TerminalDash
 
-A real-time system monitoring dashboard that runs right in your terminal. Built with Python and [Rich](https://github.com/Textualize/rich), it gives you a live view of your CPU, memory, network, GPU, and top processes — no browser tab, no bloated GUI app.
+A real-time system monitoring dashboard that runs right in your terminal. Built with Python and [Rich](https://github.com/Textualize/rich), it gives you a live view of your CPU, memory, network, GPU, and top processes, with no browser tab and no bloated GUI app.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -13,19 +13,19 @@ A real-time system monitoring dashboard that runs right in your terminal. Built 
 
 - **Per-core CPU usage** with color-coded load bars (green → yellow → red)
 - **Memory & swap** usage with live GB counters
-- **Network I/O** — real-time upload/download speed and session totals
-- **GPU monitoring** — live temperature, hot spot temp, load, power draw, and VRAM usage for AMD GPUs (via LibreHardwareMonitor), with automatic fallback for other setups
+- **Network I/O**: real-time upload/download speed and session totals
+- **GPU monitoring**: live temperature, hot spot temp, load, power draw, and VRAM usage for AMD GPUs (via LibreHardwareMonitor), with automatic fallback for other setups
 - **60-second sparkline trends** for CPU and RAM history
 - **Top 5 processes** by RAM usage
-- **SQLite logging** — CPU/RAM history is persisted to `system_metrics.db` for later analysis
+- **SQLite logging**: CPU/RAM history is persisted to `system_metrics.db` for later analysis
 
 GPU sensors are polled every 2 seconds and cached between frames, rather than on every
-one of the two repaints per second — an HTTP round trip per frame is wasted work when
+one of the two repaints per second; an HTTP round trip per frame is wasted work when
 LibreHardwareMonitor is up, and a one-second stall per frame when it is not.
 
 ## Download
 
-Grab the latest pre-built `.exe` from the [Releases page](../../releases/latest) — no Python install needed.
+Grab the latest pre-built `.exe` from the [Releases page](../../releases/latest). No Python install needed.
 
 > **Note:** Since this is an unsigned executable, Windows SmartScreen may show a "Windows protected your PC" warning on first launch. Click **More info → Run anyway** to proceed.
 
@@ -64,4 +64,8 @@ The compiled `.exe` will be in the `dist/` folder.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
+
+## Author
+
+**Abir Deol** · [abirdeol.tech](https://abirdeol.tech)
