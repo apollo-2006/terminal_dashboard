@@ -222,3 +222,6 @@ dist/
 build/
 *.spec
 *.exe
+# Metrics history and GPU fallback log written by dashboard.py
+system_metrics.db
+gpu_debug.log

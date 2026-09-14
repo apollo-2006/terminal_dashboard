@@ -4,6 +4,8 @@ import platform
 import sqlite3
 import subprocess
 import json
+import glob
+import os
 from collections import deque
 from datetime import datetime
 
@@ -42,10 +44,21 @@ class HardwareMonitor:
         self.last_time = time.time()
         self.cpu_history = deque([0] * 60, maxlen=60)
         self.ram_history = deque([0] * 60, maxlen=60)
+        self._pending = []
+        self._last_point = time.monotonic()
 
     def update_history(self, cpu, ram):
-        self.cpu_history.append(cpu)
-        self.ram_history.append(ram)
+        """Folds the readings from each repaint into one averaged point per second."""
+        # The loop repaints twice a second. Appending every repaint filled the 60 slots
+        # in 30 seconds, so the panel labelled as the last minute showed half of one.
+        self._pending.append((cpu, ram))
+        now = time.monotonic()
+        if now - self._last_point < 1.0:
+            return
+        self.cpu_history.append(sum(c for c, _ in self._pending) / len(self._pending))
+        self.ram_history.append(sum(r for _, r in self._pending) / len(self._pending))
+        self._pending.clear()
+        self._last_point = now
 
     def format_bytes(self, size):
         """Converts raw bytes into human-readable formats (KB, MB, GB)."""
@@ -257,8 +270,60 @@ def get_lhm_gpu_sensors():
 
     return data if data["temp"] is not None else None
 
-def generate_gpu_panel_lhm(sensor_data) -> Panel:
-    """Renders GPU panel from real LibreHardwareMonitor sensor data."""
+# --- Linux: the amdgpu driver's own sysfs files ---
+#
+# On Linux the numbers LibreHardwareMonitor provides on Windows are plain files: load and
+# VRAM under the card's device directory, temperatures (millidegrees) and power
+# (microwatts) under its hwmon directory. No helper process and no package needed.
+
+def _read_sysfs_number(path):
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+def get_linux_amdgpu_sensors():
+    """Reads the first amdgpu card from sysfs, in the same shape as get_lhm_gpu_sensors."""
+    for device in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
+        load = _read_sysfs_number(os.path.join(device, "gpu_busy_percent"))
+        if load is None:
+            continue  # a connector, or a card from another driver
+
+        temps, power = {}, None
+        for hwmon in sorted(glob.glob(os.path.join(device, "hwmon", "hwmon*"))):
+            for label_path in glob.glob(os.path.join(hwmon, "temp*_label")):
+                try:
+                    with open(label_path) as f:
+                        label = f.read().strip()
+                except OSError:
+                    continue
+                value = _read_sysfs_number(label_path.replace("_label", "_input"))
+                if value is not None:
+                    temps[label] = value / 1000
+            # Kernels report either the average or the instantaneous reading.
+            for name in ("power1_average", "power1_input"):
+                microwatts = _read_sysfs_number(os.path.join(hwmon, name))
+                if microwatts is not None:
+                    power = microwatts / 1_000_000
+                    break
+
+        vram_used = _read_sysfs_number(os.path.join(device, "mem_info_vram_used"))
+        vram_total = _read_sysfs_number(os.path.join(device, "mem_info_vram_total"))
+        card = os.path.basename(os.path.dirname(device))
+        return {
+            "name": f"AMD GPU ({card})",
+            "temp": temps.get("edge"),
+            "hotspot": temps.get("junction"),
+            "load": load,
+            "power": power,
+            "vram_used": vram_used / 2**20 if vram_used is not None else None,
+            "vram_total": vram_total / 2**20 if vram_total is not None else None,
+        }
+    return None
+
+def generate_gpu_sensor_panel(sensor_data, source) -> Panel:
+    """Renders the GPU panel from live sensor data, from LibreHardwareMonitor or sysfs."""
     table = Table(expand=True, show_edge=False)
     table.add_column("GPU", style="bold cyan")
     table.add_column("Load", style="bold yellow")
@@ -289,7 +354,7 @@ def generate_gpu_panel_lhm(sensor_data) -> Panel:
         if reference_temp > 100:
             border = "red"
 
-    return Panel(table, title=" GPU Information (LibreHardwareMonitor) ", border_style=border)
+    return Panel(table, title=f" GPU Information ({source}) ", border_style=border)
 
 def generate_gpu_panel() -> Panel:
     """
@@ -310,27 +375,36 @@ def generate_gpu_panel() -> Panel:
 def _build_gpu_panel() -> Panel:
     """
     Fetches GPU info, preferring real sensor data in this order:
-    1. LibreHardwareMonitor via its web server (real temp/load/vram/power)
-    2. GPUtil (Nvidia only)
-    3. Manual Win32_VideoController WMI fallback (static info only, VRAM capped at 4GB)
+    1. Linux: the amdgpu driver's sysfs files (real temp/load/vram/power)
+    2. Windows: LibreHardwareMonitor via its web server (real temp/load/vram/power)
+    3. GPUtil (Nvidia only)
+    4. Windows: manual Win32_VideoController WMI fallback (static info only, VRAM capped at 4GB)
     """
     if is_wsl():
         msg = "WSL Hypervisor Detected.\n\nRaw PCIe GPU sensors (Thermals/VRAM)\nare blocked by the Windows hypervisor.\n\nRun directly in Windows CMD/PowerShell\nto access hardware sensors."
         return Panel(Align.center(Text(msg, style="dim yellow", justify="center")), title=" GPU (Hypervisor Blocked) ", border_style="yellow")
 
-    # 1. Try LibreHardwareMonitor's web server first — this is the real fix for AMD sensors
-    if HAS_LHM_WEB:
+    is_windows = platform.system() == "Windows"
+
+    # 1. Linux reads AMD cards straight from the driver
+    if platform.system() == "Linux":
+        linux_data = get_linux_amdgpu_sensors()
+        if linux_data is not None:
+            return generate_gpu_sensor_panel(linux_data, "amdgpu")
+
+    # 2. LibreHardwareMonitor's web server, the only live source of AMD sensor data on Windows
+    if is_windows and HAS_LHM_WEB:
         try:
             lhm_data = get_lhm_gpu_sensors()
             if lhm_data is not None:
-                return generate_gpu_panel_lhm(lhm_data)
+                return generate_gpu_sensor_panel(lhm_data, "LibreHardwareMonitor")
         except Exception as e:
             # Log the real reason instead of silently falling through, so this is debuggable
             _log_gpu_debug(f"LHM web fetch failed: {type(e).__name__}: {e}")
-    else:
+    elif is_windows:
         _log_gpu_debug("'requests' module not available in this build")
 
-    # 2. Nvidia via GPUtil
+    # 3. Nvidia via GPUtil
     if HAS_GPU:
         try:
             gpu = GPUtil.getGPUs()[0]
@@ -356,12 +430,17 @@ def _build_gpu_panel() -> Panel:
         except Exception:
             pass  # Fallback to manual WMI
 
-    # 3. Manual Windows Fallback for AMD / Intel (static info only — VRAM capped at 4GB by WMI)
+    # There is no PowerShell to ask anywhere else, and trying used to fill the panel
+    # with a "No such file or directory: 'powershell'" error.
+    if not is_windows:
+        msg = "No GPU sensors found.\n\nLinux: AMD cards are read from the amdgpu driver.\nNvidia: install GPUtil."
+        return Panel(Align.center(Text(msg, style="dim", justify="center")), title=" GPU ", border_style="yellow")
+
+    # 4. Manual Windows fallback for AMD / Intel (static info only; WMI caps VRAM at 4GB)
     try:
         cmd = ['powershell', '-NoProfile', '-Command', 'Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json']
 
-        flags = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
         if not result.stdout.strip():
             return Panel(Align.center(Text("No GPU detected.", style="dim")), title=" GPU ", border_style="red")
@@ -377,7 +456,7 @@ def _build_gpu_panel() -> Panel:
         vram_display = f"{vram_gb:.1f} GB" if vram_bytes else "N/A"
 
         if vram_bytes == 4294967296 or vram_bytes == 4294967295:
-            vram_display = "4.0+ GB (WMI Capped — install LibreHardwareMonitor for real VRAM)"
+            vram_display = "4.0+ GB (WMI caps this; install LibreHardwareMonitor for real VRAM)"
 
         table = Table(expand=True, show_edge=False)
         table.add_column("GPU", style="bold cyan")
@@ -391,7 +470,7 @@ def _build_gpu_panel() -> Panel:
             vram_display,
             "Req. LHM"
         )
-        return Panel(table, title=" GPU Info (WMI Fallback — install LibreHardwareMonitor) ", border_style="cyan")
+        return Panel(table, title=" GPU Info (WMI fallback: install LibreHardwareMonitor) ", border_style="cyan")
 
     except Exception as e:
         return Panel(Align.center(Text(f"Manual GPU Query Error: {e}", style="dim red")), title=" GPU ", border_style="red")
@@ -460,11 +539,13 @@ def generate_process_panel() -> Panel:
     processes = sorted(processes, key=lambda p: p['memory_percent'] or 0, reverse=True)[:5]
 
     for p in processes:
+        # Fields psutil is denied read back as None, and one protected process
+        # would otherwise take the whole dashboard down with a TypeError.
         table.add_row(
             str(p['pid']),
-            p['name'][:15],
+            (p['name'] or '?')[:15],
             f"{p['memory_percent']:.1f}%",
-            f"{p['cpu_percent']:.1f}%"
+            f"{p['cpu_percent'] or 0.0:.1f}%"
         )
     return Panel(table, title=" ⚙️ Top Processes (RAM) ", border_style="red")
 
